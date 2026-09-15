@@ -53,34 +53,88 @@ def image_data_url(path: Path) -> str:
 
 
 def build_chain() -> Any:
-    """Create and return your LangChain chain once.
+    import os
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
 
-    Suggested imports:
-        from langchain_core.prompts import ChatPromptTemplate
-        from langchain_deepseek import ChatDeepSeek
+    receipt_reader_model = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        api_key=os.getenv("DEEPSEEK_API_KEY"),
+        temperature=0,
+    )
 
-    Use the vision-capable DeepSeek Flash model named
-    ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
-    """
-    ### YOUR CODE HERE
-    return None
+    system_prompt_text = """你是一个超市收据结构化提取器。请仔细阅读这张收据图片，只输出一个JSON对象，不要输出任何解释或多余文字。
+
+字段要求：
+- subtotal：收据上的SUBTOTAL金额，数字，正数。
+- discounts：所有折扣、促销、优惠券行的金额列表。即使收据上显示为负数，也写成正数。例如 5% OFF -5.39 写成 5.39。
+- rounding：ROUNDING行金额，数字，可以为正或负；没有就写0。
+- final_payment：ROUNDING之后最终支付的金额，数字，正数。通常是OCTOPUS、CASH、VISA等支付行。
+
+只输出JSON，不要markdown代码块，不要额外文字。"""
+
+    receipt_extraction_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt_text),
+        ("human", [
+            {"type": "text", "text": "请抽取这张收据的信息。"},
+            {"type": "image_url", "image_url": {"url": "{image_url}"}},
+        ]),
+    ])
+
+    return receipt_extraction_prompt | receipt_reader_model
+
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
-    """Run your chain and return one response for each exact query string.
+    grand_total_paid = Decimal("0")
+    grand_total_without_discounts = Decimal("0")
 
-    ``images`` contains every receipt in the selected folder. A valid return
-    value looks like:
+    for each_receipt_path in images:
+        image_url_for_model = image_data_url(each_receipt_path)
+        best_fields = None
+        best_discount_sum = Decimal("-1")
 
-        {QUERY_1: "HK$123.40", QUERY_2: "HK$150.00"}
+        for attempt_number in range(3):
+            model_reply = chain.invoke({"image_url": image_url_for_model})
+            raw_reply_text = response_text(model_reply)
 
-    Use the provided ``image_data_url(path)`` helper to put local images in
-    multimodal human messages. LangChain's ``batch`` method is one simple way
-    to process independent receipt-extraction prompts in parallel.
-    """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+            cleaned_reply_text = raw_reply_text.strip()
+            cleaned_reply_text = re.sub(r"^```(?:json)?\s*", "", cleaned_reply_text)
+            cleaned_reply_text = re.sub(r"\s*```$", "", cleaned_reply_text)
+
+            json_object_match = re.search(r"\{.*\}", cleaned_reply_text, re.DOTALL)
+            if not json_object_match:
+                continue
+            candidate_fields = json.loads(json_object_match.group())
+
+            candidate_discount_sum = sum(
+                abs(Decimal(str(each_discount)))
+                for each_discount in candidate_fields.get("discounts", [])
+            )
+
+            if candidate_discount_sum > best_discount_sum:
+                best_discount_sum = candidate_discount_sum
+                best_fields = candidate_fields
+
+        if best_fields is None:
+            continue
+
+        subtotal_amount = Decimal(str(best_fields.get("subtotal", 0)))
+        discount_amounts = [
+            Decimal(str(each_discount))
+            for each_discount in best_fields.get("discounts", [])
+        ]
+        final_payment_amount = Decimal(str(best_fields.get("final_payment", 0)))
+
+        grand_total_paid += final_payment_amount
+        grand_total_without_discounts += subtotal_amount + sum(
+            abs(each_discount) for each_discount in discount_amounts
+        )
+
+    return {
+        QUERY_1: f"HK${grand_total_paid:.2f}",
+        QUERY_2: f"HK${grand_total_without_discounts:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
@@ -89,6 +143,7 @@ _MONEY_RE = re.compile(
     r"(?<![\w.])(?:HK\$|\$)?\s*(-?\d[\d,]*(?:\.\d+)?)(?![\w.])",
     re.IGNORECASE,
 )
+
 
 
 def response_text(value: Any) -> str:
