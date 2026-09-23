@@ -53,87 +53,112 @@ def image_data_url(path: Path) -> str:
 
 
 def build_chain() -> Any:
+    """Create and return your LangChain chain once.
+
+    Suggested imports:
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_deepseek import ChatDeepSeek
+
+    Use the vision-capable DeepSeek Flash model named
+    ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
+    """
     import os
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_deepseek import ChatDeepSeek
 
-    receipt_reader_model = ChatDeepSeek(
+    model = ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         temperature=0,
     )
 
-    system_prompt_text = """你是一个超市收据结构化提取器。请仔细阅读这张收据图片，只输出一个JSON对象，不要输出任何解释或多余文字。
-
-字段要求：
-- subtotal：收据上的SUBTOTAL金额，数字，正数。
-- discounts：所有折扣、促销、优惠券行的金额列表。即使收据上显示为负数，也写成正数。例如 5% OFF -5.39 写成 5.39。
-- rounding：ROUNDING行金额，数字，可以为正或负；没有就写0。
-- final_payment：ROUNDING之后最终支付的金额，数字，正数。通常是OCTOPUS、CASH、VISA等支付行。
-
-只输出JSON，不要markdown代码块，不要额外文字。"""
-
-    receipt_extraction_prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt_text),
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", (
+            "You are a supermarket receipt structured extractor. "
+            "Read this receipt image carefully and output ONLY a single JSON object, "
+            "with no explanation and no extra text.\n\n"
+            "Fields:\n"
+            "- subtotal: the SUBTOTAL amount on the receipt, as a positive number.\n"
+            "- discounts: list every discount, promotion, coupon, SAVINGS, or COUPON line "
+            "that appears on the receipt. Even if the receipt shows them as negative numbers, "
+            "write them as positive numbers. If there are multiple discount lines on the same "
+            "receipt, list them all - do not omit any line, and do not list only the largest one.\n"
+            "- rounding: the ROUNDING line amount, as a number; can be positive or negative. "
+            "Write 0 if it is absent.\n"
+            "- final_payment: the final payment amount after ROUNDING, as a positive number. "
+            "It is usually the OCTOPUS, CASH, or VISA payment line.\n\n"
+            "Output only JSON. No markdown code block. No extra text."
+        )),
         ("human", [
-            {"type": "text", "text": "请抽取这张收据的信息。"},
+            {"type": "text", "text": "Extract the fields from this receipt."},
             {"type": "image_url", "image_url": {"url": "{image_url}"}},
         ]),
     ])
 
-    return receipt_extraction_prompt | receipt_reader_model
-
+    return prompt | model
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
-    grand_total_paid = Decimal("0")
-    grand_total_without_discounts = Decimal("0")
+    """Run your chain and return one response for each exact query string.
 
-    for each_receipt_path in images:
-        image_url_for_model = image_data_url(each_receipt_path)
+    ``images`` contains every receipt in the selected folder. A valid return
+    value looks like:
+
+        {QUERY_1: "HK$123.40", QUERY_2: "HK$150.00"}
+
+    Use the provided ``image_data_url(path)`` helper to put local images in
+    multimodal human messages. LangChain's ``batch`` method is one simple way
+    to process independent receipt-extraction prompts in parallel.
+    """
+    total_paid = Decimal("0")
+    total_without_discounts = Decimal("0")
+
+    for path in images:
+        image_url = image_data_url(path)
         best_fields = None
         best_discount_sum = Decimal("-1")
 
-        for attempt_number in range(3):
-            model_reply = chain.invoke({"image_url": image_url_for_model})
-            raw_reply_text = response_text(model_reply)
+        for attempt in range(3):
+            reply = chain.invoke({"image_url": image_url})
+            text = response_text(reply)
 
-            cleaned_reply_text = raw_reply_text.strip()
-            cleaned_reply_text = re.sub(r"^```(?:json)?\s*", "", cleaned_reply_text)
-            cleaned_reply_text = re.sub(r"\s*```$", "", cleaned_reply_text)
+            text = text.strip()
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
 
-            json_object_match = re.search(r"\{.*\}", cleaned_reply_text, re.DOTALL)
-            if not json_object_match:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
                 continue
-            candidate_fields = json.loads(json_object_match.group())
+            try:
+                fields = json.loads(match.group())
+            except json.JSONDecodeError:
+                continue
 
-            candidate_discount_sum = sum(
-                abs(Decimal(str(each_discount)))
-                for each_discount in candidate_fields.get("discounts", [])
+            discount_sum = sum(
+                abs(Decimal(str(x)))
+                for x in fields.get("discounts", [])
             )
 
-            if candidate_discount_sum > best_discount_sum:
-                best_discount_sum = candidate_discount_sum
-                best_fields = candidate_fields
+            if discount_sum > best_discount_sum:
+                best_discount_sum = discount_sum
+                best_fields = fields
 
         if best_fields is None:
             continue
 
-        subtotal_amount = Decimal(str(best_fields.get("subtotal", 0)))
-        discount_amounts = [
-            Decimal(str(each_discount))
-            for each_discount in best_fields.get("discounts", [])
+        subtotal = Decimal(str(best_fields.get("subtotal", 0)))
+        discounts = [
+            Decimal(str(x))
+            for x in best_fields.get("discounts", [])
         ]
-        final_payment_amount = Decimal(str(best_fields.get("final_payment", 0)))
+        final_payment = Decimal(str(best_fields.get("final_payment", 0)))
 
-        grand_total_paid += final_payment_amount
-        grand_total_without_discounts += subtotal_amount + sum(
-            abs(each_discount) for each_discount in discount_amounts
-        )
+        total_paid += final_payment
+        total_without_discounts += subtotal + sum(abs(x) for x in discounts)
 
     return {
-        QUERY_1: f"HK${grand_total_paid:.2f}",
-        QUERY_2: f"HK${grand_total_without_discounts:.2f}",
+        QUERY_1: f"HK${total_paid:.2f}",
+        QUERY_2: f"HK${total_without_discounts:.2f}",
     }
 
 
@@ -143,7 +168,6 @@ _MONEY_RE = re.compile(
     r"(?<![\w.])(?:HK\$|\$)?\s*(-?\d[\d,]*(?:\.\d+)?)(?![\w.])",
     re.IGNORECASE,
 )
-
 
 
 def response_text(value: Any) -> str:
